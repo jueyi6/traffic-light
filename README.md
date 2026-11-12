@@ -26,4 +26,4 @@ claude plugin install traffic-light --marketplace jueyi6/traffic-light
 
 In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `jueyi6/traffic-light`, then Add plugin.
 
-The repository is private: it installs only for people who can read it on GitHub and whose machine holds a git credential for github.com.
+The repository is public: anyone can read the code and install the mod.
