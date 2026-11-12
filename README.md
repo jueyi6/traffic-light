@@ -27,3 +27,7 @@ claude plugin install traffic-light --marketplace jueyi6/traffic-light
 In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `jueyi6/traffic-light`, then Add plugin.
 
 The repository is public: anyone can read the code and install the mod.
+
+## License
+
+[MIT-0](LICENSE) (MIT No Attribution): use, copy, modify and distribute freely, no credit required.
