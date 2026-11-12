@@ -1,0 +1,5 @@
+{
+  "name": "traffic-light-marketplace",
+  "owner": { "name": "jueyi6" },
+  "plugins": [{ "name": "traffic-light", "source": "./" }]
+}
