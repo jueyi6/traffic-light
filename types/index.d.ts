@@ -7,16 +7,20 @@ export type Light = {
   status: Status
   count: number
   running: number
+  // Tokens the item holds in the context just by being loaded (an estimate).
+  fixed: number
+  // Tokens of its schemas that are deferred, so not in the context (drawn struck through).
+  deferred: number
+  // Tokens its prompt added when it was invoked, summed (estimated from its text).
+  body: number
 }
 
 declare module 'claude-code' {
   interface PluginState {
     'traffic-light': {
       lights: Shaped<Light[]>
-      // Groups the person has unfolded.
+      // Status sections the person has unfolded.
       open: Shaped<string[]>
-      // True: hide everything this session has not used yet.
-      onlyUsed: Shaped<boolean>
     }
   }
 }
