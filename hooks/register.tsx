@@ -1,231 +1,274 @@
-import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
-
-import type { Group, Light, Status } from '../types'
+import type { EngineInterface, Register, SessionContextBreakdown } from 'claude-code'
 
 const PANE = 'traffic-light'
-const TITLE_OF_PANE = '도구 신호등'
+const TITLE = '도구 신호등'
 
-// Change a tag when the stored fields change: it declines what an earlier
-// version stored, which outlives a reload.
-const lights = atom({ plugin: 'traffic-light', key: 'lights' } as const, [], {
-  shape: 'lights-5',
+type Ctx = 'loaded' | 'listed' | 'waiting'
+type Cat = 'ok' | 'err' | Ctx
+const CATS: Cat[] = ['ok', 'err', 'loaded', 'listed', 'waiting']
+const NAME: Record<Cat, string> = { ok: '사용함', err: '오류', loaded: '로드됨', listed: '목록만', waiting: '지연 로드' }
+const DOT: Record<Cat, string> = { ok: '🟢', err: '🔴', loaded: '🟡', listed: '🔵', waiting: '⚪' }
+
+type Kid = { label: string; tokens: number; isLoaded: boolean; bare?: true }
+type Row = { label: string; group: string; tokens: Record<Ctx, number>; kids?: Kid[] }
+
+type Item = { label: string; group: string; mark: string; right: string; tokens?: number; was?: number; kids?: Kid[] }
+// Each light's colour, taken from the emoji dot beside it, so a number matches its light.
+const COLOR: Record<Cat, string> = { ok: '#58cf8c', err: '#e54c64', loaded: '#e5bc4e', listed: '#4f8bd1', waiting: '#dcd4e2' }
+const GROUPS =['Skills', '플러그인', 'MCP', '에이전트', '시스템', '메모리']
+const fmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k` : String(Math.round(n)))
+// What a row holds now; "start → now" when it held something else at session start.
+const sinceStart = (was: number | undefined, now: number): string =>
+  was !== undefined && was > 0 && Math.round(was) !== Math.round(now) ? `${fmt(was)} → ${fmt(now)}` : fmt(now)
+
+const parse = (b: SessionContextBreakdown | undefined): Row[] => {
+  const rows: Row[] = []
+  if (!b) return rows
+  const zero = { loaded: 0, listed: 0, waiting: 0 }
+  // A plugin's skill belongs to its plugin: by `pluginName`, or by the `plugin:skill` name.
+  const plugins = new Map<string, Kid[]>()
+  for (const s of b.skills?.skillFrontmatter ?? []) {
+    const plugin = s.pluginName ?? (s.name.includes(':') ? s.name.split(':')[0] : undefined)
+    if (!plugin) {
+      rows.push({ label: s.name, group: 'Skills', tokens: { ...zero, listed: s.tokens } })
+      continue
+    }
+    const kid = { label: s.name.startsWith(`${plugin}:`) ? s.name.slice(plugin.length + 1) : s.name, tokens: s.tokens, isLoaded: true }
+    plugins.set(plugin, [...(plugins.get(plugin) ?? []), kid])
+  }
+  for (const [name, kids] of plugins) {
+    rows.push({ label: name, group: '플러그인', tokens: { ...zero, listed: kids.reduce((n, k) => n + k.tokens, 0) }, kids })
+  }
+  const servers = new Map<string, { tokens: Record<Ctx, number>; kids: Kid[] }>()
+  for (const t of b.mcpTools ?? []) {
+    const have = servers.get(t.serverName) ?? { tokens: { ...zero }, kids: [] }
+    if (t.isLoaded) have.tokens.loaded += t.tokens
+    else have.tokens.waiting += t.tokens
+    have.kids.push({ label: t.name.replace(`mcp__${t.serverName}__`, ''), tokens: t.tokens, isLoaded: t.isLoaded })
+    servers.set(t.serverName, have)
+  }
+  for (const [name, have] of servers) rows.push({ label: name, group: 'MCP', tokens: have.tokens, kids: have.kids })
+  for (const a of b.agents ?? []) {
+    rows.push({ label: a.agentType, group: '에이전트', tokens: { ...zero, listed: a.tokens } })
+  }
+  for (const m of b.memoryFiles ?? []) {
+    rows.push({ label: m.path.split(/[\\/]/).pop() ?? m.path, group: '메모리', tokens: { ...zero, loaded: m.tokens } })
+  }
+
+  return rows
+}
+
+type Cut = { name: string; tokens: number; kind: string }
+type Total = { used: number; max: number; percent: number; cuts: Cut[] }
+const CAT_NAME: Record<string, string> = {
+  'Messages': '메시지',
+  'System prompt': '시스템 프롬프트',
+  'MCP server instructions': 'MCP 서버 지침',
+}
+// Categories the lights below already show, so the list leaves them out: the lights and what
+// is left here add up to the total.
+const IN_LIGHTS = new Set([
+  'System tools',
+  'System tools (deferred)',
+  'MCP tools',
+  'MCP tools (deferred)',
+  'Skills',
+  'Memory files',
+  'Custom agents',
+])
+const totalOf = (b: SessionContextBreakdown | undefined): Total => ({
+  used: b?.totalTokens ?? 0,
+  max: b?.rawMaxTokens ?? 0,
+  percent: b?.percentage ?? 0,
+  cuts: (b?.categories ?? [])
+    .filter(c => c.kind === 'used' || c.kind === 'deferred')
+    .map(c => ({ name: c.name, tokens: c.tokens, kind: c.kind })),
 })
-// Which sections are unfolded: a status ('ok') or a type inside one ('ok/skill').
-// The live statuses start open, with their types; the rest start folded.
-const LIVE = ['run', 'ok', 'err']
-const ALL_GROUPS = ['skill', 'plugin', 'mcp', 'agent', 'builtin']
-const ALL_KEYS = [
-  'run', 'ok', 'err', 'used', 'none',
-  ...['run', 'ok', 'err', 'used', 'none'].flatMap(c => ALL_GROUPS.map(g => `${c}/${g}`)),
-  ...ALL_GROUPS.map(g => `inv/${g}`),
-]
-const open = atom(
-  { plugin: 'traffic-light', key: 'open' } as const,
-  [...LIVE, ...LIVE.flatMap(c => ALL_GROUPS.map(g => `${c}/${g}`))],
-  { shape: 'open-3' },
-)
 
-const ORDER: Group[] = ['skill', 'plugin', 'mcp', 'agent', 'builtin']
-const TAG: Record<Group, string> = {
-  skill: '스킬',
-  plugin: '플러그인',
-  mcp: 'MCP',
-  agent: '에이전트',
-  builtin: '내장',
+let rows: Row[] = []
+// What each row and category held at session start: written once, by the first reading.
+let start: Map<string, number> | null = null
+const sum = (r: Row) => r.tokens.loaded + r.tokens.listed + r.tokens.waiting
+let total: Total = { used: 0, max: 0, percent: 0, cuts: [] }
+const everyKey = ['ctx', ...CATS, ...CATS.flatMap(c => GROUPS.map(g => `${c}/${g}`))]
+let detail = false
+// The engine drops a tree past its bounds (100,000 characters serialized), and the app then keeps
+// the old drawing. A heavy user's lists can pass that, so a drawing shows at most this many item
+// rows and detail lines, and says how many it left out. Headers and buttons are always drawn.
+const MAX_ITEMS = 150
+const MAX_KIDS = 100
+let unfolded = new Set<string>(['ctx', 'ok', 'err', 'loaded', ...['ok', 'err', 'loaded'].flatMap(c => GROUPS.map(g => `${c}/${g}`))])
+
+type Used = { label: string; group: string; count: number; running: number; failed: boolean; flashUntil: number; fresh: boolean; est: number }
+const used = new Map<string, Used>()
+const SPIN = ['◜', '◝', '◞', '◟']
+let frame = 0
+let timer: { cancel: () => void } | null = null
+let now = 0
+const FLASH_MS = 3000
+const MAX_LIVE = 50
+const markOf = (u: Used): string =>
+  u.running > 0 ? `${SPIN[frame % SPIN.length]} ` : u.flashUntil > now ? `${frame % 2 === 1 ? '💥' : '🔴'} ` : ''
+const isBusy =() => [...used.values()].some(u => u.running > 0 || u.flashUntil > now)
+const spin = ($: EngineInterface) => {
+  if (timer || !isBusy()) return
+  timer = $.clock.every(500, () => {
+    void $.clock.now().then(t => {
+      now = t
+      frame += 1
+      if (!isBusy()) {
+        timer?.cancel()
+        timer = null
+      }
+      $.ui.invalidate('ui.render')
+    })
+  })
 }
-
-const TITLE: Record<Group, string> = {
-  skill: '스킬',
-  plugin: '플러그인',
-  mcp: 'MCP 서버',
-  agent: '서브에이전트',
-  builtin: '내장 도구',
-}
-
-// The five sections of the pane, in the order they are drawn: running, used this
-// round, failed, pulled out (what holds context), and what holds none.
-type Cat = 'run' | 'ok' | 'err' | 'used' | 'none'
-const CATS: Cat[] = ['run', 'ok', 'err', 'used', 'none']
-const NAME: Record<Cat, string> = {
-  run: '실행중',
-  ok: '사용함',
-  err: '오류',
-  used: '꺼냄',
-  none: '미사용',
-}
-const DOT: Record<Cat, string> = { run: '🟡', ok: '🟢', err: '🔴', used: '🔵', none: '⚪' }
-
-// Pulled out = it holds context: its schema is loaded (a callable built-in, a loaded
-// MCP tool), or it was invoked and its prompt or call entered the context.
-const isPulled = (one: Light, loaded: Set<string>): boolean => one.count > 0 || loaded.has(one.key)
-
-// `loaded`: keys of rows whose schema or prompt already sits in the context.
-const catOf = (one: Light, loaded: Set<string>): Cat => {
-  const status: Status = one.status
-  if (status === 'run') return 'run'
-  if (status === 'err') return 'err'
-  if (status === 'ok') return 'ok'
-
-  return isPulled(one, loaded) ? 'used' : 'none'
-}
-
-// Ids of servers and plugins are compared in the tool-name spelling.
-const norm = (s: string): string => s.replace(/[^A-Za-z0-9]/g, '_')
-
-type Touch = {
-  group: Group
-  id: string
-  label: string
-  // 'start' = a call began, 'end' = it finished, 'mark' = a one-shot use.
-  phase: 'start' | 'end' | 'mark'
-  isError?: boolean
-  // Estimated tokens a 'mark' put into the context (a skill's expanded prompt).
-  body?: number
-}
-
-// Rough: about four characters to a token. Free: no model or API is asked.
-const estimate = (text: string): number => Math.ceil(text.length / 4)
-
-const fmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
-
-// "320 · 호출 ≈1.1k": what a row holds just by being loaded, and what its calls added.
-const cost = (fixed: number, body: number): string =>
-  [fixed > 0 ? fmt(fixed) : '', body > 0 ? `호출 ≈${fmt(body)}` : ''].filter(Boolean).join(' · ')
-
-// Pure: returns the list with one row begun, finished or marked.
-const touch = (list: Light[], t: Touch): Light[] => {
-  const key = `${t.group}:${t.id}`
-  const old = list.find(one => one.key === key)
-  const base: Light = old ?? {
-    key,
-    group: t.group,
-    label: t.label,
-    status: 'idle',
-    count: 0,
-    running: 0,
-    fixed: 0,
-    deferred: 0,
-    body: 0,
-  }
-  let next: Light = { ...base, label: t.label }
-  if (t.phase === 'start') {
-    next = { ...next, count: next.count + 1, running: next.running + 1, status: 'run' }
-  } else if (t.phase === 'end') {
-    const running = Math.max(0, next.running - 1)
-    next = {
-      ...next,
-      running,
-      status: t.isError ? 'err' : running > 0 ? 'run' : 'ok',
-    }
+const touch = (key: string, label: string, group: string, phase: 'start' | 'end' | 'mark', isError = false) => {
+  const have = used.get(key) ?? { label, group, count: 0, running: 0, failed: false, flashUntil: 0, fresh: true, est: 0 }
+  have.fresh = true
+  if (phase === 'start') {
+    have.count += 1
+    have.running += 1
+  } else if (phase === 'end') {
+    have.running = Math.max(0, have.running - 1)
+    have.failed = isError
   } else {
-    next = {
-      ...next,
-      count: next.count + 1,
-      status: t.isError ? 'err' : 'ok',
-      body: next.body + (t.body ?? 0),
+    have.count += 1
+    have.failed = isError
+  }
+  used.set(key, have)
+}
+const statusText = (): string | undefined => {
+  const list = [...used.values()]
+  const failed = list.filter(u => u.failed).length
+  const okCount = list.length - failed
+  if (okCount + failed === 0) return undefined
+  const loaded = rows.filter(r => r.tokens.loaded > 0).length
+
+  return `🟢${okCount} 🔴${failed} 🟡${loaded}`
+}
+// A rough size of what a call put into the conversation (characters / 4), shown with ≈ in detail.
+const sizeOf = (...parts: unknown[]): number => {
+  let chars = 0
+  for (const part of parts) {
+    try {
+      chars += part === undefined ? 0 : (typeof part === 'string' ? part : JSON.stringify(part) ?? '').length
+    } catch {
+      // a value that cannot be written out adds nothing
     }
   }
-  const rest = list.filter(one => one.key !== key)
 
-  return [...rest, next].slice(-120)
+  return Math.round(chars / 4)
 }
-
-// What a tool.call is, for the pane: null for calls shown elsewhere.
-const classify = (tool: string, input: Record<string, unknown>): Omit<Touch, 'phase'> | null => {
-  if (tool === 'Skill') return null // drawn from skill.prompt, which names the skill
+const withEst = (u: Used, detail: boolean) => (detail && u.est > 0 ? `  ≈${fmt(u.est)}` : '')
+const flash = async ($: EngineInterface, key: string) => {
+  now = await $.clock.now()
+  const have = used.get(key)
+  if (have) have.flashUntil = now + FLASH_MS
+  spin($)
+}
+const classify = (tool: string, input: Record<string, unknown>): { key: string; label: string; group: string } | null => {
+  if (tool === 'Skill') return null
   if (tool.startsWith('mcp__')) {
     const server = tool.split('__')[1] ?? 'mcp'
-    return { group: 'mcp', id: norm(server), label: server }
+    return { key: `mcp:${server}`, label: server, group: 'MCP' }
   }
   if (tool === 'Agent' || tool === 'Task') {
     const kind = typeof input.subagent_type === 'string' ? input.subagent_type : 'agent'
-    return { group: 'agent', id: kind, label: kind }
+    return { key: `agent:${kind}`, label: kind, group: '에이전트' }
   }
-  return { group: 'builtin', id: tool, label: tool }
+  return { key: `builtin:${tool}`, label: tool, group: '시스템' }
 }
 
-const tally = (list: Light[]) => ({
-  run: list.filter(one => one.status === 'run').length,
-  ok: list.filter(one => one.status === 'ok').length,
-  err: list.filter(one => one.status === 'err').length,
-})
+// The transcript announces the tools behind ToolSearch in `deferred_tools_delta` records; the
+// engine's breakdown gives system tools only as totals. Read the file as it grows (a read costs
+// the model no context) and keep the set of announced names.
+const CHUNK = 4 * 1024 * 1024
+const announced = { path: '', offset: 0, carry: '', names: new Set<string>() }
 
-// The one-line summary pinned under the prompt, so a closed pane still shows it.
-const statusText = (list: Light[]): string | undefined => {
-  const t = tally(list)
-  if (t.run + t.ok + t.err === 0) return undefined
-  const live = list.filter(one => one.status === 'run').map(one => one.label)
+const readDeferred = async ($: EngineInterface): Promise<Set<string>> => {
+  const { transcriptPath } = await $.session.info()
+  if (announced.path !== transcriptPath) Object.assign(announced, { path: transcriptPath, offset: 0, carry: '', names: new Set<string>() })
+  const { size } = await $.fs.stat(transcriptPath)
+  if (size < announced.offset) Object.assign(announced, { offset: 0, carry: '', names: new Set<string>() })
+  while (announced.offset < size) {
+    const chunk = await $.fs.read(transcriptPath, { offset: announced.offset, length: CHUNK })
+    announced.offset += CHUNK
+    const lines = (announced.carry + chunk).split('\n')
+    announced.carry = lines.pop() ?? ''
+    for (const line of lines) {
+      if (!line.includes('"deferred_tools_delta"')) continue
+      try {
+        const a = (JSON.parse(line) as { attachment?: { type?: string; addedNames?: string[]; removedNames?: string[] } }).attachment
+        if (a?.type !== 'deferred_tools_delta') continue
+        for (const n of a.addedNames ?? []) announced.names.add(n)
+        for (const n of a.removedNames ?? []) announced.names.delete(n)
+      } catch {
+        // a line cut at a chunk edge is not a record
+      }
+    }
+  }
 
-  return `🚦 🟡${t.run} 🟢${t.ok} 🔴${t.err}${live.length > 0 ? ` · ${live.slice(0, 3).join(', ')}` : ''}`
+  return announced.names
 }
 
-// Bookkeeping must never touch the work it watches: a failed write, read or
-// status call is dropped, so a tool call, a skill or a prompt always goes on.
-const safely = async (fn: () => unknown): Promise<void> => {
+const refresh = async ($: EngineInterface) => {
   try {
-    await fn()
+    const usage = await $.session.usage({ breakdown: 'summary' })
+    rows = parse(usage.context.breakdown)
+    total = totalOf(usage.context.breakdown)
+    if (start === null && (rows.length > 0 || total.cuts.length > 0)) {
+      start = new Map([
+        ...rows.map(r => [`${r.group}:${r.label}`, sum(r)] as [string, number]),
+        ...total.cuts.map(c => [`cat:${c.name}`, c.tokens] as [string, number]),
+      ])
+    }
+    // The engine counts system tools only in total, loaded and deferred apart: each total is one
+    // row. Names come from the transcript's deferred announcements and the tool list.
+    let names: { loaded: Kid[]; waiting: Kid[] } | undefined
+    try {
+      const deferred = await readDeferred($)
+      const system = (await $.tool.list()).filter(t => !t.mcp).map(t => t.name).sort()
+      const bare = (n: string, isLoaded: boolean): Kid => ({ label: n, tokens: 0, isLoaded, bare: true })
+      names = {
+        loaded: system.filter(n => !deferred.has(n)).map(n => bare(n, true)),
+        waiting: system.filter(n => deferred.has(n)).map(n => bare(n, false)),
+      }
+    } catch {
+      // without names the totals stand alone
+    }
+    for (const [name, label, ctx] of [['System tools', '시스템 도구', 'loaded'], ['System tools (deferred)', '시스템 도구 (지연)', 'waiting']] as const) {
+      const cut = total.cuts.find(c => c.name === name)
+      if (cut && cut.tokens > 0) rows.push({ label, group: '시스템', tokens: { loaded: 0, listed: 0, waiting: 0, [ctx]: cut.tokens }, kids: names?.[ctx] })
+    }
+    $.ui.invalidate('ui.render')
   } catch {
-    // the light is wrong for a moment; the work is not
+    // the pane shows the last rows it had
   }
 }
-
-// What the session owns, as the context breakdown lists it.
-type Owned = { key: string; group: Group; label: string; tokens: number; deferred: number }
-const emptyOwned: Owned[] = []
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'traffic',
-      description: 'Toggle the traffic-light pane (skills, MCP, plugins in use)',
-    })
-    void $.ui.open({ id: PANE, title: TITLE_OF_PANE })
+    await $.command.register({ name: 'traffic', description: 'Open the traffic-light pane' })
+    // A reload leaves the pane drawn by the old module; open it again so this module's buttons are live.
+    if ((await $.ui.panes()).some(pane => pane.id === PANE)) await $.ui.open({ id: PANE, title: TITLE })
+    void refresh($)
 
     return next(e)
   })
 
-  // /traffic opens the pane, or closes it when it is already open.
   on('command.run', { command: 'traffic' }, async $ => {
-    const isUp = (await $.ui.panes()).some(pane => pane.id === PANE)
-    if (isUp) {
-      await $.ui.close({ id: PANE })
-
-      return { text: 'Traffic-light pane closed. /traffic opens it again.' }
-    }
-    await $.ui.open({ id: PANE, title: TITLE_OF_PANE })
+    await refresh($)
+    await $.ui.open({ id: PANE, title: TITLE })
 
     return { text: 'Traffic-light pane opened.' }
   })
 
-  // A new prompt starts a new round: every light goes grey, counts stay.
-  on('prompt.submit', async ($, e, next) => {
-    await safely(async () => {
-      await update($, lights, list =>
-        list.map(one => (one.running > 0 ? one : { ...one, status: 'idle' as const })),
-      )
-      $.ui.status(statusText(await read($, lights)))
-    })
-
-    return next(e)
-  })
-
   on('skill.prompt', async ($, e, next) => {
-    const name = e.skill
-    const colon = name.indexOf(':')
-    const body = estimate(e.text ?? '')
-    await safely(async () => {
-      await update($, lights, list => {
-        let out = touch(list, { group: 'skill', id: name, label: name, phase: 'mark', body })
-        if (colon > 0) {
-          const plugin = name.slice(0, colon)
-          out = touch(out, { group: 'plugin', id: norm(plugin), label: plugin, phase: 'mark', body })
-        }
-
-        return out
-      })
-      $.ui.status(statusText(await read($, lights)))
-    })
+    touch(`skill:${e.skill}`, e.skill, 'Skills', 'mark')
+    $.ui.status(statusText())
+    $.ui.invalidate('ui.render')
 
     return next(e)
   })
@@ -233,280 +276,185 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const what = classify(e.tool, e as unknown as Record<string, unknown>)
     if (what === null) return next(e)
-
-    const finish = (isError: boolean) =>
-      safely(async () => {
-        await update($, lights, list => touch(list, { ...what, phase: 'end', isError }))
-        $.ui.status(statusText(await read($, lights)))
-        if (isError) $.ui.toast(`🔴 ${what.label} 오류`)
-      })
-
-    await safely(async () => {
-      await update($, lights, list => touch(list, { ...what, phase: 'start' }))
-      $.ui.status(statusText(await read($, lights)))
-    })
+    touch(what.key, what.label, what.group, 'start')
+    spin($)
+    $.ui.status(statusText())
+    $.ui.invalidate('ui.render')
     let ran
     try {
       ran = await next(e)
     } catch (err) {
-      await finish(true)
+      touch(what.key, what.label, what.group, 'end', true)
+      await flash($, what.key)
+      $.ui.invalidate('ui.render')
       throw err
     }
-    await finish(ran.deny !== undefined || ran.isError === true)
+    const failed = ran.deny !== undefined || ran.isError === true
+    touch(what.key, what.label, what.group, 'end', failed)
+    const have = used.get(what.key)
+    if (have) have.est += sizeOf(e, ran.result, ran.text)
+    if (failed) await flash($, what.key)
+    $.ui.status(statusText())
+    $.ui.invalidate('ui.render')
 
     return ran
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    for (const u of used.values()) if (u.running === 0) u.fresh = false
+    $.ui.invalidate('ui.render')
+    void refresh($)
+
+    return next(e)
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const used = await read($, lights)
-    const unfolded = await read($, open)
-
-    // Everything the session owns; a failed read leaves only what was used.
-    // `loaded` holds the rows already pulled into the context.
-    let owned: Owned[] = emptyOwned
-    const loaded = new Set<string>()
-    try {
-      const usage = await $.session.usage({ breakdown: 'summary' })
-      const breakdown = usage.context.breakdown
-      const next: Owned[] = []
-      const perPlugin = new Map<string, number>()
-      for (const s of breakdown?.skills?.skillFrontmatter ?? []) {
-        next.push({ key: `skill:${s.name}`, group: 'skill', label: s.name, tokens: s.tokens, deferred: 0 })
-        if (s.pluginName) {
-          perPlugin.set(s.pluginName, (perPlugin.get(s.pluginName) ?? 0) + s.tokens)
-        }
-      }
-      for (const [plugin, tokens] of perPlugin) {
-        next.push({ key: `plugin:${norm(plugin)}`, group: 'plugin', label: plugin, tokens, deferred: 0 })
-      }
-      // A server holds tokens only for the tools whose schema is in the context;
-      // the schemas still deferred are counted apart, drawn struck through.
-      const perServer = new Map<
-        string,
-        { total: number; loaded: number; tokens: number; deferred: number }
-      >()
-      for (const t of breakdown?.mcpTools ?? []) {
-        const have = perServer.get(t.serverName) ?? { total: 0, loaded: 0, tokens: 0, deferred: 0 }
-        perServer.set(t.serverName, {
-          total: have.total + 1,
-          loaded: have.loaded + (t.isLoaded ? 1 : 0),
-          tokens: have.tokens + (t.isLoaded ? t.tokens : 0),
-          deferred: have.deferred + (t.isLoaded ? 0 : t.tokens),
-        })
-      }
-      for (const [server, n] of perServer) {
-        const key = `mcp:${norm(server)}`
-        const label = n.loaded === n.total ? `${server} (${n.total})` : `${server} (${n.loaded}/${n.total})`
-        next.push({ key, group: 'mcp', label, tokens: n.tokens, deferred: n.deferred })
-        if (n.loaded > 0) loaded.add(key)
-      }
-      for (const a of breakdown?.agents ?? []) {
-        next.push({ key: `agent:${a.agentType}`, group: 'agent', label: a.agentType, tokens: a.tokens, deferred: 0 })
-      }
-      // Built-in tools the model can call now; Skill and Agent are drawn as
-      // skills and agents, so they are not listed twice.
-      for (const t of await $.tool.list()) {
-        if (t.mcp || t.name === 'Skill' || t.name === 'Agent' || t.name === 'Task') continue
-        // The model can call it now, so its schema is already in the context.
-        next.push({ key: `builtin:${t.name}`, group: 'builtin', label: t.name, tokens: 0, deferred: 0 })
-        loaded.add(`builtin:${t.name}`)
-      }
-      owned = next
-    } catch {
-      owned = emptyOwned
+    const set = (next: Set<string>) => () => {
+      unfolded = next
+      $.ui.invalidate('ui.render')
+    }
+    const toggle = (cat: string) => () => {
+      const next = new Set(unfolded)
+      if (!next.delete(cat)) next.add(cat)
+      unfolded = next
+      $.ui.invalidate('ui.render')
     }
 
-    // Owned rows start as never used; used rows lay their light over them.
-    const rows = new Map<string, Light>()
-    for (const o of owned) {
-      rows.set(o.key, {
-        key: o.key,
-        group: o.group,
-        label: o.label,
-        status: 'idle',
-        count: 0,
-        running: 0,
-        fixed: o.tokens,
-        deferred: o.deferred,
-        body: 0,
-      })
-    }
-    for (const u of used) {
-      const have = rows.get(u.key)
-      rows.set(u.key, have ? { ...u, label: have.label, fixed: have.fixed, deferred: have.deferred } : u)
-    }
-
-    // Tokens a row holds in the context (plain), and tokens it would hold but does not
-    // (deferred or not pulled out; struck through). MCP and built-ins know which of
-    // their schemas are loaded; the rest count whole, by whether they were pulled out.
-    const split = (one: Light) => {
-      if (one.group === 'mcp' || one.group === 'builtin') {
-        return { eaten: one.fixed, skipped: one.deferred }
-      }
-
-      return isPulled(one, loaded)
-        ? { eaten: one.fixed, skipped: 0 }
-        : { eaten: 0, skipped: one.fixed }
-    }
-
-    // The cost text of a row or a type: what it holds, then what is deferred struck through.
-    const costOf = (fixed: number, body: number, deferred: number) => {
-      const lead = cost(fixed, body)
-
-      return (
-        <Text dimColor>
-          {lead}
-          {lead !== '' && deferred > 0 ? ' ' : ''}
-          {deferred > 0 && <Text strikethrough>{fmt(deferred)}</Text>}
-        </Text>
-      )
-    }
-    const all = [...rows.values()]
-    const inOrder = (list: Light[]) =>
-      [...list].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
-
-    const toggle = (key: string) =>
-      update($, open, list => (list.includes(key) ? list.filter(one => one !== key) : [...list, key]))
-
-    // What is running or was just used, on top; running first.
-    const live = all
-      .filter(one => ['run', 'ok', 'err'].includes(catOf(one, loaded)))
-      .sort(
-        (a, b) =>
-          CATS.indexOf(catOf(a, loaded)) - CATS.indexOf(catOf(b, loaded)) ||
-          b.count - a.count ||
-          a.label.localeCompare(b.label),
-      )
+    const live = [...used.values()]
+      .filter(u => u.running > 0 || u.fresh)
+      .sort((a, b) => Number(b.running > 0) - Number(a.running > 0) || b.count - a.count || a.label.localeCompare(b.label))
+    let itemsLeft = MAX_ITEMS
+    let kidsLeft = MAX_KIDS
 
     return (
       <Box flexDirection="column">
         <Box marginBottom={1}>
-          <Button key="expand" onPress={() => update($, open, () => [...ALL_KEYS])}>
-            펼침
-          </Button>
+          <Button key="expand" onPress={set(new Set(everyKey))}>펼침</Button>
           <Text> </Text>
-          <Button key="fold" onPress={() => update($, open, () => [])}>
-            접음
+          <Button key="fold" onPress={set(new Set())}>접음</Button>
+          <Text> </Text>
+          <Button
+            key="detail"
+            onPress={() => {
+              detail = !detail
+              $.ui.invalidate('ui.render')
+            }}
+          >
+            상세 {detail ? '켬' : '끔'}
           </Button>
         </Box>
-
+        <Box flexDirection="column" marginBottom={1}>
+          <Button key="ctx" plain onPress={toggle('ctx')}>
+            {unfolded.has('ctx') ? '∨' : '>'} 컨텍스트 {fmt(total.used)} / {fmt(total.max)} ({Math.round(total.percent)}%)
+          </Button>
+          {unfolded.has('ctx') &&
+            total.cuts
+              .filter(c => !IN_LIGHTS.has(c.name))
+              .sort((a, b) => b.tokens - a.tokens)
+              .map(c => (
+                <Box marginLeft={2} justifyContent="space-between">
+                  <Text wrap="truncate-middle" dimColor={c.kind === 'deferred'}>{CAT_NAME[c.name] ?? c.name}</Text>
+                  <Text color={c.name === 'Messages' ? COLOR.ok : COLOR.loaded} strikethrough={c.kind === 'deferred'}>{sinceStart(start?.get(`cat:${c.name}`), c.tokens)}{c.kind !== 'deferred' && total.max > 0 ? `  ${((c.tokens / total.max) * 100).toFixed(1)}%` : ''}</Text>
+                </Box>
+              ))}
+        </Box>
         <Box flexDirection="column" marginBottom={1}>
           <Text bold>지금 / 방금</Text>
-          {live.map(one => (
+          {live.slice(0, MAX_LIVE).map(u => (
             <Box justifyContent="space-between">
-              <Text wrap="truncate-middle">
-                {DOT[catOf(one, loaded)]} {one.label}
-                {one.count > 0 ? ` ×${one.count}` : ''}
-              </Text>
-              <Text dimColor>{TAG[one.group]}</Text>
+              <Text wrap="truncate-middle">{markOf(u) || `${u.failed ? '🔴' : '🟢'} `}{u.label} ×{u.count}{withEst(u, detail)}</Text>
+              <Text dimColor>{u.group}</Text>
             </Box>
           ))}
+          {live.length > MAX_LIVE && <Text dimColor>{`… 외 ${live.length - MAX_LIVE}개 생략`}</Text>}
         </Box>
-
         {CATS.map(cat => {
-          // 꺼냄 holds what sits in the context, also what is running or green now.
-          const inCat = all.filter(one =>
-            cat === 'used' ? isPulled(one, loaded) : catOf(one, loaded) === cat,
-          )
-          const isOpen = unfolded.includes(cat) && inCat.length > 0
+          const isUse = cat === 'ok' || cat === 'err'
+          const items: Item[] = isUse
+            ? [...used.values()]
+                .filter(u => (cat === 'err' ? u.failed : !u.failed))
+                .map(u => ({
+                  label: u.label,
+                  group: u.group,
+                  mark: markOf(u),
+                  right: `×${u.count}${withEst(u, detail)}`,
+                }))
+            : rows
+                .filter(r => r.tokens[cat as Ctx] > 0)
+                .map(r => ({
+                  label: r.label,
+                  group: r.group,
+                  mark: '',
+                  right: '',
+                  tokens: r.tokens[cat as Ctx],
+                  was: start?.get(`${r.group}:${r.label}`),
+                  kids: r.kids,
+                }))
+          const isOpen = unfolded.has(cat)
+          const groups = GROUPS.filter(g => items.some(i => i.group === g))
+          const groupTokens = (g: string): number => items.filter(i => i.group === g).reduce((n, i) => n + (i.tokens ?? 0), 0)
+          const catTokens = groups.reduce((n, g) => n + groupTokens(g), 0)
+          const number = (n: number | undefined) =>
+            n === undefined || isUse ? null : (
+              <Text color={COLOR[cat]} strikethrough={cat === 'waiting'}>{fmt(n)}</Text>
+            )
 
           return (
             <Box flexDirection="column">
-              <Button
-                key={`c-${cat}`}
-                plain
-                dimColor={inCat.length === 0}
-                onPress={() => toggle(cat)}
-              >
-                {isOpen ? '▾' : '▸'} {DOT[cat]} {NAME[cat]} {inCat.length}
-              </Button>
+              <Box justifyContent="space-between">
+                <Button key={`c-${cat}`} plain onPress={toggle(cat)}>
+                  {isOpen ? '∨' : '>'} {DOT[cat]} {NAME[cat]} {items.length}
+                </Button>
+                {number(catTokens)}
+              </Box>
               {isOpen &&
-                ORDER.map(group => {
-                  const items = inOrder(inCat.filter(one => one.group === group))
-                  if (items.length === 0) return null
-                  const subKey = `${cat}/${group}`
-                  const isSubOpen = unfolded.includes(subKey)
+                groups.map(g => {
+                  const inGroup = items.filter(i => i.group === g)
+                  const isGroupOpen = unfolded.has(`${cat}/${g}`)
 
                   return (
                     <Box flexDirection="column" marginLeft={2}>
-                      <Button key={`s-${subKey}`} plain onPress={() => toggle(subKey)}>
-                        {isSubOpen ? '▾' : '▸'} {TAG[group]} {items.length}
-                      </Button>
-                      {isSubOpen &&
-                        items.map(one => (
-                          <Box marginLeft={3}>
-                            <Text wrap="truncate-middle">
-                              {one.label}
-                              {one.count > 0 ? ` ×${one.count}` : ''}
-                            </Text>
-                          </Box>
-                        ))}
+                      <Box justifyContent="space-between">
+                        <Button key={`i-${cat}-${g}`} plain onPress={toggle(`${cat}/${g}`)}>
+                          {isGroupOpen ? '∨' : '>'} {g} {inGroup.length}
+                        </Button>
+                        {number(groupTokens(g))}
+                      </Box>
+                      {isGroupOpen &&
+                        inGroup.map(i => {
+                          if (itemsLeft <= 0) return null
+                          itemsLeft -= 1
+                          const shownKids = detail && i.kids ? i.kids.slice(0, Math.max(0, kidsLeft)) : []
+                          kidsLeft -= shownKids.length
+
+                          return (
+                            <Box flexDirection="column" marginLeft={2}>
+                              <Box justifyContent="space-between">
+                                <Text wrap="truncate-middle">{i.mark}{i.label}</Text>
+                                <Text color={COLOR[cat]} strikethrough={cat === 'waiting'}>{i.tokens !== undefined ? sinceStart(i.was, i.tokens) : i.right}</Text>
+                              </Box>
+                              {shownKids.map(k => (
+                                <Box marginLeft={4} justifyContent="space-between">
+                                  <Text wrap="truncate-middle" dimColor>{k.label}</Text>
+                                  {!k.bare && <Text dimColor strikethrough={!k.isLoaded}>{fmt(k.tokens)}</Text>}
+                                </Box>
+                              ))}
+                              {detail && i.kids && shownKids.length < i.kids.length && (
+                                <Text dimColor>{`    … 외 ${i.kids.length - shownKids.length}줄 생략`}</Text>
+                              )}
+                            </Box>
+                          )
+                        })}
+                      {isGroupOpen && itemsLeft <= 0 && inGroup.length > 0 && (
+                        <Text dimColor>  … 줄 수 한도로 일부 생략 (접어서 줄이세요)</Text>
+                      )}
                     </Box>
                   )
                 })}
             </Box>
           )
         })}
-
-        {/* Below the five sections: everything the session owns, by type. */}
-        <Box flexDirection="column" marginTop={1}>
-          {ORDER.map(group => {
-            const items = all
-              .filter(one => one.group === group)
-              .sort(
-                (a, b) =>
-                  CATS.indexOf(catOf(a, loaded)) - CATS.indexOf(catOf(b, loaded)) ||
-                  b.count - a.count ||
-                  a.label.localeCompare(b.label),
-              )
-            if (items.length === 0) return null
-            const key = `inv/${group}`
-            const isOpen = unfolded.includes(key)
-            const usedCount = items.filter(one => one.count > 0).length
-            const n = (cat: Cat) =>
-              items.filter(one => (cat === 'used' ? isPulled(one, loaded) : catOf(one, loaded) === cat))
-                .length
-
-            return (
-              <Box flexDirection="column">
-                <Box justifyContent="space-between">
-                  <Button key={`i-${group}`} plain onPress={() => toggle(key)}>
-                    {isOpen ? '▾' : '▸'} {TITLE[group]}
-                  </Button>
-                  <Box>
-                    <Text>
-                      {(['run', 'ok', 'err', 'used'] as Cat[])
-                        .filter(c => n(c) > 0)
-                        .map(c => `${DOT[c]}${n(c)}`)
-                        .join(' ')}
-                      {'  '}
-                    </Text>
-                    {costOf(
-                      items.reduce((sum, one) => sum + split(one).eaten, 0),
-                      items.reduce((sum, one) => sum + one.body, 0),
-                      items.reduce((sum, one) => sum + split(one).skipped, 0),
-                    )}
-                    <Text>
-                      {'  '}
-                      {usedCount}/{items.length}
-                    </Text>
-                  </Box>
-                </Box>
-                {isOpen &&
-                  items.map(one => (
-                    <Box marginLeft={2} justifyContent="space-between">
-                      <Text wrap="truncate-middle" dimColor={catOf(one, loaded) === 'none'}>
-                        {DOT[catOf(one, loaded)]} {one.label}
-                        {one.count > 0 ? ` ×${one.count}` : ''}
-                      </Text>
-                      {costOf(split(one).eaten, one.body, split(one).skipped)}
-                    </Box>
-                  ))}
-              </Box>
-            )
-          })}
-        </Box>
       </Box>
     )
   })

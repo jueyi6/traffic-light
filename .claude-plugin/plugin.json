@@ -1,7 +1,6 @@
 {
   "name": "traffic-light",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT-0",
-  "description": "Side pane that shows with traffic lights which skills, MCP servers, plugins, agents and built-in tools Claude is using.",
-  "types": "./types/index.d.ts"
+  "description": "Side pane that shows what sits in Claude's context, in five light colors: used, failed, loaded, listed only, deferred."
 }
