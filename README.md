@@ -4,10 +4,6 @@
 
 A side pane for Claude Code that shows what sits in your context, in five lights, and what each skill, plugin, MCP server, agent, memory file and subagent costs.
 
-![demo](docs/demo.gif)
-
-> The demo is a real screen recording of the pane (cursor and captions added), sped up while the subagent runs.
-
 ## Install
 
 ```
