@@ -51,15 +51,6 @@
 - Claude 데스크톱 앱의 플러그인 패널용입니다. 탐색기 버튼은 Windows 전용입니다.
 - 숫자는 엔진이 내놓는 컨텍스트 구성 값을 쓰므로 엔진의 합계와 맞습니다. 서브에이전트 `시작`/`작업`과 호출당 `≈` 크기는 위에서 설명한 대로 측정하거나 추정한 값입니다.
 
-## 개발
-
-`.claude-plugin/types/`는 Claude Code가 만드는 폴더라 git에 없고, `tsconfig.json`은 그 폴더가 있는 PC에서만 풀립니다. 저장소 루트에서:
-
-```
-claude plugin validate .
-claude plugin test .
-```
-
 ## 라이선스
 
 [MIT-0](LICENSE)
