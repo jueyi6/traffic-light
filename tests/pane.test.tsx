@@ -103,3 +103,20 @@ test('an expanded pane of a big session stays within the tree bounds', async ($,
   expect((await ui.findAll({})).length).toBeLessThan(1100)
   await ui.unmount()
 })
+
+test('memory files become folder buttons, capped, with unique keys', async ($, on) => {
+  const memoryFiles = Array.from({ length: 40 }, (_, i) => ({ path: `C:/mem/file${i}.md`, type: 'User', tokens: 10 }))
+  const withMemory = { context: { breakdown: { ...usage.context.breakdown, memoryFiles } } }
+  on('command.register', () => ({ value: { command: 'traffic' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.panes', () => ({ value: [] }))
+  on('session.usage', () => ({ value: withMemory as never }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 50; i += 1) await Promise.resolve()
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'expand' })
+  const folders = (await ui.findAll({ type: 'Button' })).filter(b => (b.text ?? '').startsWith('📂'))
+  expect(folders.length).toBe(30)
+  expect(new Set(folders.map(b => b.key)).size).toBe(30)
+  await ui.unmount()
+})
