@@ -11,7 +11,8 @@
 ## 설치
 
 ```
-/plugin install traffic-light --marketplace jueyi6/traffic-light
+/plugin marketplace add jueyi6/traffic-light
+/plugin install traffic-light@traffic-light-marketplace
 ```
 
 `/traffic`으로 패널을 엽니다.

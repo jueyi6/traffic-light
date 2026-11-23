@@ -11,7 +11,8 @@ A side pane for Claude Code that shows what sits in your context, in five lights
 ## Install
 
 ```
-/plugin install traffic-light --marketplace jueyi6/traffic-light
+/plugin marketplace add jueyi6/traffic-light
+/plugin install traffic-light@traffic-light-marketplace
 ```
 
 Open the pane with `/traffic`.
