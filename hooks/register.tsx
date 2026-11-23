@@ -5,7 +5,7 @@ const TITLE = '도구 신호등'
 
 type Ctx = 'loaded' | 'listed' | 'waiting'
 type Cat = 'ok' | 'err' | Ctx
-const CATS: Cat[] = ['ok', 'err', 'loaded', 'listed', 'waiting']
+const CATS: Cat[] = ['ok', 'loaded', 'err', 'listed', 'waiting']
 const NAME: Record<Cat, string> = { ok: '사용함', err: '오류', loaded: '로드됨', listed: '목록만', waiting: '지연 로드' }
 const DOT: Record<Cat, string> = { ok: '🟢', err: '🔴', loaded: '🟡', listed: '🔵', waiting: '⚪' }
 
@@ -104,7 +104,7 @@ const MAX_ITEMS = 150
 const MAX_KIDS = 50
 let unfolded = new Set<string>(['ctx', 'agents', 'ok', 'err', 'loaded', ...['ok', 'err', 'loaded'].flatMap(c => GROUPS.map(g => `${c}/${g}`))])
 
-type Used = { label: string; group: string; count: number; running: number; failed: boolean; flashUntil: number; fresh: boolean; recent: number; est: number }
+type Used = { label: string; group: string; count: number; running: number; failed: boolean; flashUntil: number; fresh: boolean; recent: number; est: number; recentEst: number }
 const used = new Map<string, Used>()
 const SPIN = ['◜', '◝', '◞', '◟']
 let frame = 0
@@ -187,7 +187,7 @@ const spin = ($: EngineInterface) => {
   })
 }
 const touch = (key: string, label: string, group: string, phase: 'start' | 'end' | 'mark', isError = false) => {
-  const have = used.get(key) ?? { label, group, count: 0, running: 0, failed: false, flashUntil: 0, fresh: true, recent: 0, est: 0 }
+  const have = used.get(key) ?? { label, group, count: 0, running: 0, failed: false, flashUntil: 0, fresh: true, recent: 0, est: 0, recentEst: 0 }
   have.fresh = true
   if (phase === 'start') {
     have.count += 1
@@ -210,7 +210,7 @@ const statusText = (): string | undefined => {
   if (okCount + failed === 0) return undefined
   const loaded = rows.filter(r => r.tokens.loaded > 0).length
 
-  return `🟢${okCount} 🔴${failed} 🟡${loaded}`
+  return `🟢${okCount} 🟡${loaded} 🔴${failed}`
 }
 // A rough size of what a call put into the conversation (characters / 4), shown with ≈ in detail.
 const WEIGH_NODES = 2000
@@ -392,7 +392,11 @@ export const register: Register = on => {
       })
     }
     const have = used.get(what.key)
-    if (have) have.est += sizeOf(e, ran.result, ran.text)
+    if (have) {
+      const size = sizeOf(e, ran.result, ran.text)
+      have.est += size
+      have.recentEst += size
+    }
     if (failed) await flash($, what.key)
     $.ui.status(statusText())
     $.ui.invalidate('ui.render')
@@ -404,6 +408,7 @@ export const register: Register = on => {
     for (const u of used.values()) if (u.running === 0) {
       u.fresh = false
       u.recent = 0
+      u.recentEst = 0
     }
     $.ui.invalidate('ui.render')
     void refresh($).then(() => {
@@ -544,7 +549,7 @@ export const register: Register = on => {
           )}
           {live.slice(0, MAX_LIVE).map(u => (
             <Box justifyContent="space-between">
-              <Text wrap="truncate-middle">{markOf(u) || `${u.failed ? '🔴' : '🟢'} `}{u.label} ×{u.recent}{withEst(u, detail)}</Text>
+              <Text wrap="truncate-middle">{markOf(u) || `${u.failed ? '🔴' : '🟢'} `}{u.label} ×{u.recent}{detail && u.recentEst > 0 ? `  ≈${fmt(u.recentEst)}` : ''}</Text>
               <Text dimColor>{u.group}</Text>
             </Box>
           ))}
